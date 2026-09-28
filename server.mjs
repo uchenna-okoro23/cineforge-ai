@@ -71,38 +71,45 @@ async function hfGenerate({prompt,image,aspectRatio="16:9",duration=5}){
   const safeDuration=Math.max(0.3,Math.min(8.5,Number(duration)||5));
   const data=[prompt,"worst quality, inconsistent motion, blurry, jittery, distorted",inputImage,null,dimensions[0],dimensions[1],apiName==="image_to_video"?"image-to-video":"text-to-video",safeDuration,9,42,true,3,false];
   console.log("HF request",JSON.stringify({apiName,aspectRatio,height:dimensions[0],width:dimensions[1],duration:safeDuration,hasImage:Boolean(inputImage)}));
-  const call=await fetch(space+"/gradio_api/call/"+apiName,{method:"POST",headers:{"Content-Type":"application/json",...(process.env.HF_TOKEN?{Authorization:"Bearer "+process.env.HF_TOKEN}:{})},body:JSON.stringify({data})});
-  if(!call.ok)throw new Error("Video provider rejected the generation request.");
-  const c=await call.json();
-  const ev=c.event_id;
-  if(!ev)throw new Error("Video provider returned no event id.");
-  const stream=await fetch(space+"/gradio_api/call/"+apiName+"/"+ev);
-  if(!stream.ok)throw new Error("Video provider event stream failed.");
-  const text=await stream.text();
-  console.log("HF Gradio stream received",text.slice(-6000));
-  const lines=text.split(/\r?\n/).filter(x=>x.startsWith("data:"));
-  let providerError=null;
-  for(const line of lines){
-    const raw=line.slice(5).trim();
-    if(!raw||raw==="null") continue;
+  const headers={"Content-Type":"application/json",...(process.env.HF_TOKEN?{Authorization:"Bearer "+process.env.HF_TOKEN}:{})};
+  let lastError=null;
+  for(let attempt=1;attempt<=3;attempt++){
     try{
-      const d=JSON.parse(raw);
-      if(!Array.isArray(d)) {
-        if(typeof d==="string") providerError=d;
-        continue;
+      console.log("HF generation attempt",attempt,"of 3");
+      const call=await fetch(space+"/gradio_api/call/"+apiName,{method:"POST",headers,body:JSON.stringify({data})});
+      if(!call.ok) throw new Error("Provider request HTTP "+call.status);
+      const c=await call.json();
+      const ev=c.event_id;
+      if(!ev) throw new Error("Provider returned no event id");
+      const stream=await fetch(space+"/gradio_api/call/"+apiName+"/"+ev);
+      if(!stream.ok) throw new Error("Provider event stream HTTP "+stream.status);
+      const text=await stream.text();
+      console.log("HF Gradio stream attempt",attempt,text.slice(-6000));
+      const lines=text.split(/\r?\n/).filter(x=>x.startsWith("data:"));
+      let providerError=null;
+      let sawError=false;
+      for(const line of lines){
+        const raw=line.slice(5).trim();
+        if(!raw||raw==="null") continue;
+        try{
+          const d=JSON.parse(raw);
+          if(!Array.isArray(d)){ providerError=typeof d==="string"?d:(d?.error||d?.message||null); continue; }
+          if(!d.length) continue;
+          const v=d[0];
+          if(v&&typeof v==="object"&&(v.error||v.message)) providerError=v.error||v.message;
+          const candidates=[v?.url,v?.video?.url,v?.path,v?.video?.path,v?.file?.url,v?.file?.path,v];
+          for(const candidate of candidates){
+            const localUrl=await materializeProviderVideo(candidate,space);
+            if(localUrl)return localUrl;
+          }
+        }catch(e){ console.log("HF Gradio data parse skipped",e.message); }
       }
-      if(!d.length) continue;
-      const v=d[0];
-      if(v&&typeof v==="object"&&(v.error||v.message)) providerError=v.error||v.message;
-      const candidates=[v?.url,v?.video?.url,v?.path,v?.video?.path,v?.file?.url,v?.file?.path,v];
-      for(const candidate of candidates){
-        const localUrl=await materializeProviderVideo(candidate,space);
-        if(localUrl)return localUrl;
-      }
-    }catch(e){console.log("HF Gradio data parse skipped",e.message)}
+      if(text.includes("event: error")) sawError=true;
+      lastError=providerError?("Video provider error: "+String(providerError).slice(0,500)):(sawError?"Video provider returned an error event without details.":"Video provider returned no usable video file.");
+    }catch(e){ lastError=e.message; console.log("HF generation attempt failed",attempt,e.message); }
+    if(attempt<3) await sleep(2000*attempt);
   }
-  if(providerError) throw new Error("Video provider error: "+String(providerError).slice(0,500));
-  throw new Error("Video provider finished but CineForge could not download the generated video file.");
+  throw new Error(lastError||"Video provider failed.");
 };
 app.post("/api/generate-video",async(req,res)=>{
   const id=crypto.randomUUID();
