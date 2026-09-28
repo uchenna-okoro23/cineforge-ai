@@ -72,4 +72,39 @@ async function hfGenerate({prompt,image,aspectRatio="16:9",duration=5}){
     }catch(e){console.log("HF Gradio data parse skipped",e.message)}
   }
   throw new Error("Video provider finished but CineForge could not download the generated video file.");
-};;
+};
+app.post("/api/generate-video",async(req,res)=>{
+  const id=crypto.randomUUID();
+  const j={id,status:"queued"};
+  jobs.set(id,j);
+  if(process.env.DATABASE_URL)db().then(()=>pool.query("insert into cineforge_jobs(id,status) values($1,$2) on conflict do nothing",[id,"queued"])).catch(()=>{});
+  res.json(j);
+  (async()=>{
+    j.status="processing";
+    try{
+      const url=await hfGenerate({prompt:req.body?.prompt||"",image:req.body?.image||"",aspectRatio:req.body?.aspectRatio||"16:9",duration:req.body?.duration||5});
+      j.status="completed";j.videoUrl=url;
+      if(process.env.DATABASE_URL)await pool.query("update cineforge_jobs set status=$1,video_url=$2 where id=$3",["completed",url,id]);
+    }catch(e){
+      j.status="failed";j.error=e.message||"Generation failed";
+      if(process.env.DATABASE_URL)await pool.query("update cineforge_jobs set status=$1,error=$2 where id=$3",["failed",j.error,id]).catch(()=>{});
+    }
+  })();
+});
+app.get("/api/generate-video/:id",async(req,res)=>{
+  const local=jobs.get(req.params.id);
+  if(local)return res.json(local);
+  try{
+    await db();
+    const q=await pool.query("select id,status,video_url,error from cineforge_jobs where id=$1",[req.params.id]);
+    if(!q.rows[0])return res.status(404).json({error:"Job not found. Keep this tab open while generation runs."});
+    const row=q.rows[0];
+    res.json({id:row.id,status:row.status,videoUrl:row.video_url||undefined,error:row.error||undefined});
+  }catch(e){res.status(500).json({error:e.message})}
+});
+const dist=path.join(__dirname,"dist");
+app.use(express.static(dist));
+app.get("*",(req,res)=>res.sendFile(path.join(dist,"index.html")));
+const port=process.env.PORT||10000;
+app.listen(port,()=>console.log("CineForge listening on "+port));
+db().then(()=>console.log("CineForge DB ready")).catch(e=>console.error("CineForge DB initialization failed:",e.message));
