@@ -8,22 +8,43 @@ fs.mkdirSync(generatedDir,{recursive:true});
 app.use("/generated",express.static(generatedDir,{maxAge:"1h"}));
 
 async function materializeProviderVideo(candidate,space){
-  if(typeof candidate!=="string"||!candidate) return null;
-  let url=candidate;
-  if(candidate.startsWith("/file=")) url=space+candidate;
-  else if(candidate.startsWith("/tmp/")||candidate.startsWith("/home/")||candidate.startsWith("/gradio/")) url=space+"/file="+candidate;
-  else if(candidate.startsWith("/")) url=space+candidate;
-  if(!(url.startsWith("http://")||url.startsWith("https://"))) return null;
-  const r=await fetch(url,{headers:process.env.HF_TOKEN?{Authorization:"Bearer "+process.env.HF_TOKEN}:{}});
-  if(!r.ok) return null;
-  const type=String(r.headers.get("content-type")||"").toLowerCase();
-  const buf=Buffer.from(await r.arrayBuffer());
-  if(buf.length<1024) return null;
-  const isMp4=buf.subarray(4,12).toString("ascii").includes("ftyp")||type.includes("video")||type.includes("mp4");
-  if(!isMp4) return null;
-  const name=crypto.randomUUID()+".mp4";
-  await fs.promises.writeFile(path.join(generatedDir,name),buf);
-  return String(process.env.PUBLIC_URL||"").replace(/\/$/,"")+"/generated/"+name;
+  if(candidate==null) return null;
+  let value=candidate;
+  if(typeof value==="object"){
+    value=value.url||value.path||value.video?.url||value.video?.path||value.file?.url||value.file?.path||null;
+  }
+  if(typeof value!=="string"||!value) return null;
+  let url=value;
+  if(value.startsWith("http://")||value.startsWith("https://")) {
+    url=value;
+  } else if(value.startsWith("/file=")) {
+    url=space+value;
+  } else if(value.startsWith("/tmp/")||value.startsWith("/home/")||value.startsWith("/gradio/")) {
+    url=space+"/file="+value;
+  } else if(value.startsWith("/")) {
+    url=space+value;
+  } else {
+    return null;
+  }
+  const headers=process.env.HF_TOKEN?{Authorization:"Bearer "+process.env.HF_TOKEN}:{};
+  for(let attempt=0;attempt<3;attempt++){
+    try{
+      const r=await fetch(url,{headers,redirect:"follow"});
+      if(!r.ok){ if(attempt<2){await sleep(500*(attempt+1));continue;} return null; }
+      const type=String(r.headers.get("content-type")||"").toLowerCase();
+      const buf=Buffer.from(await r.arrayBuffer());
+      if(buf.length<1024){ if(attempt<2){await sleep(500*(attempt+1));continue;} return null; }
+      const isMp4=buf.subarray(4,12).toString("ascii").includes("ftyp")||type.includes("video")||type.includes("mp4");
+      if(!isMp4) return null;
+      const name=crypto.randomUUID()+".mp4";
+      await fs.promises.writeFile(path.join(generatedDir,name),buf);
+      return String(process.env.PUBLIC_URL||"").replace(/\/$/,"")+"/generated/"+name;
+    }catch(e){
+      console.log("Provider video download attempt failed",attempt+1,e.message);
+      if(attempt<2) await sleep(500*(attempt+1));
+    }
+  }
+  return null;
 }
 app.get("/api/_healthcheck",async(_,res)=>{try{await db();res.json({ok:true,service:"cineforge-ai"})}catch(e){res.status(503).json({ok:false,error:e.message})}});
 app.get("/api/provider-status",async(_,res)=>{res.json({provider:process.env.VIDEO_PROVIDER||"hf_ltx_fast",space:process.env.HF_SPACE_URL||"https://lightricks-ltx-video-distilled.hf.space",status:"ready",authentication:process.env.HF_TOKEN?"token":"public-space"})});
@@ -49,6 +70,7 @@ async function hfGenerate({prompt,image,aspectRatio="16:9",duration=5}){
   const dimensions=aspectRatio==="9:16"?[768,432]:aspectRatio==="1:1"?[576,576]:[432,768];
   const safeDuration=Math.max(0.3,Math.min(8.5,Number(duration)||5));
   const data=[prompt,"worst quality, inconsistent motion, blurry, jittery, distorted",inputImage,null,dimensions[0],dimensions[1],apiName==="image_to_video"?"image-to-video":"text-to-video",safeDuration,9,42,true,3,false];
+  console.log("HF request",JSON.stringify({apiName,aspectRatio,height:dimensions[0],width:dimensions[1],duration:safeDuration,hasImage:Boolean(inputImage)}));
   const call=await fetch(space+"/gradio_api/call/"+apiName,{method:"POST",headers:{"Content-Type":"application/json",...(process.env.HF_TOKEN?{Authorization:"Bearer "+process.env.HF_TOKEN}:{})},body:JSON.stringify({data})});
   if(!call.ok)throw new Error("Video provider rejected the generation request.");
   const c=await call.json();
@@ -57,20 +79,29 @@ async function hfGenerate({prompt,image,aspectRatio="16:9",duration=5}){
   const stream=await fetch(space+"/gradio_api/call/"+apiName+"/"+ev);
   if(!stream.ok)throw new Error("Video provider event stream failed.");
   const text=await stream.text();
-  console.log("HF Gradio stream received",text.slice(-3000));
-  const lines=text.split("\n").filter(x=>x.startsWith("data:"));
-  for(const line of lines.reverse()){
+  console.log("HF Gradio stream received",text.slice(-6000));
+  const lines=text.split(/\r?\n/).filter(x=>x.startsWith("data:"));
+  let providerError=null;
+  for(const line of lines){
+    const raw=line.slice(5).trim();
+    if(!raw||raw==="null") continue;
     try{
-      const d=JSON.parse(line.slice(5).trim());
-      if(!Array.isArray(d)||!d.length)continue;
+      const d=JSON.parse(raw);
+      if(!Array.isArray(d)) {
+        if(typeof d==="string") providerError=d;
+        continue;
+      }
+      if(!d.length) continue;
       const v=d[0];
-      const candidates=[v?.url,v?.video?.url,v?.path,v?.video?.path,v];
+      if(v&&typeof v==="object"&&(v.error||v.message)) providerError=v.error||v.message;
+      const candidates=[v?.url,v?.video?.url,v?.path,v?.video?.path,v?.file?.url,v?.file?.path,v];
       for(const candidate of candidates){
         const localUrl=await materializeProviderVideo(candidate,space);
         if(localUrl)return localUrl;
       }
     }catch(e){console.log("HF Gradio data parse skipped",e.message)}
   }
+  if(providerError) throw new Error("Video provider error: "+String(providerError).slice(0,500));
   throw new Error("Video provider finished but CineForge could not download the generated video file.");
 };
 app.post("/api/generate-video",async(req,res)=>{
