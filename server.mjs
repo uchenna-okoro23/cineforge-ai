@@ -13,7 +13,7 @@ async function materializeProviderVideo(candidate,space){
   if(candidate.startsWith("/file=")) url=space+candidate;
   else if(candidate.startsWith("/tmp/")||candidate.startsWith("/home/")||candidate.startsWith("/gradio/")) url=space+"/file="+candidate;
   else if(candidate.startsWith("/")) url=space+candidate;
-  if(!/^https?:\\/\\//.test(url)) return null;
+  if(!(url.startsWith("http://")||url.startsWith("https://"))) return null;
   const r=await fetch(url,{headers:process.env.HF_TOKEN?{Authorization:"Bearer "+process.env.HF_TOKEN}:{}});
   if(!r.ok) return null;
   const type=String(r.headers.get("content-type")||"").toLowerCase();
@@ -23,7 +23,7 @@ async function materializeProviderVideo(candidate,space){
   if(!isMp4) return null;
   const name=crypto.randomUUID()+".mp4";
   await fs.promises.writeFile(path.join(generatedDir,name),buf);
-  return (process.env.PUBLIC_URL||"").replace(/\\/$/,"")+"/generated/"+name;
+  return String(process.env.PUBLIC_URL||"").replace(/\/$/,"")+"/generated/"+name;
 }
 app.get("/api/_healthcheck",async(_,res)=>{try{await db();res.json({ok:true,service:"cineforge-ai"})}catch(e){res.status(503).json({ok:false,error:e.message})}});
 app.get("/api/provider-status",async(_,res)=>{res.json({provider:process.env.VIDEO_PROVIDER||"hf_ltx_fast",space:process.env.HF_SPACE_URL||"https://lightricks-ltx-video-distilled.hf.space",status:"ready",authentication:process.env.HF_TOKEN?"token":"public-space"})});
