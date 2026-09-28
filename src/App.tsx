@@ -145,22 +145,24 @@ function App() {
       const result = response.data as {
         status?: string;
         predictionId?: string;
+        id?: string;
         videoUrl?: string;
         error?: string;
       };
       let readyUrl = result.videoUrl || '';
-      if (!readyUrl && result.predictionId) {
-        for (let attempt = 0; attempt < 80; attempt += 1) {
+      const jobId = result.predictionId || result.id;
+      if (!readyUrl && jobId) {
+        for (let attempt = 0; attempt < 200; attempt += 1) {
           await new Promise(resolve => setTimeout(resolve, 3000));
           const poll = await api.get(
-            `/api/generate-video/${encodeURIComponent(result.predictionId)}`
+            `/api/generate-video/${encodeURIComponent(jobId)}`
           );
           const current = poll.data as {
             status?: string;
             videoUrl?: string;
             error?: string;
           };
-          if (current.status === 'succeeded' && current.videoUrl) {
+          if ((current.status === 'completed' || current.status === 'succeeded') && current.videoUrl) {
             readyUrl = current.videoUrl;
             break;
           }
@@ -170,7 +172,7 @@ function App() {
           setStatus(
             `Generating with free Hugging Face ZeroGPU… ${Math.min(
               99,
-              Math.round(((attempt + 1) / 80) * 100)
+              Math.round(((attempt + 1) / 200) * 100)
             )}%`
           );
         }
@@ -178,7 +180,7 @@ function App() {
       if (!readyUrl) {
         throw new Error(
           result.error ||
-            'Video generation timed out. The provider did not finish within 4 minutes.'
+            'Video generation is still processing. The provider did not finish within 10 minutes.'
         );
       }
       setVideoUrl(readyUrl);
